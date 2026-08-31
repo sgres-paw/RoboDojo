@@ -36,6 +36,10 @@ Examples:
   bash scripts/RoboDojo/download_ckpt.sh modelscope G05
   bash scripts/RoboDojo/download_ckpt.sh huggingface VLAct
   bash scripts/RoboDojo/download_ckpt.sh modelscope VLAct
+  bash scripts/RoboDojo/download_ckpt.sh huggingface Meituan_robotic
+  bash scripts/RoboDojo/download_ckpt.sh modelscope Meituan_robotic
+  bash scripts/RoboDojo/download_ckpt.sh huggingface DM05
+  bash scripts/RoboDojo/download_ckpt.sh modelscope DM05
 
 The selected policy is downloaded to:
   XPolicyLab/policy/<POLICY>/checkpoints
@@ -127,6 +131,7 @@ declare -A POLICY_NAME_MAP=(
   [act]="ACT"
   [abotm0]="Abot_M0"
   [dm0]="Dexbotic_DM0"
+  [dm05]="DM_05"
   [dexora]="Dexora_1B"
   [eventvla]="EventVLA"
   [fastwam]="FastWAM"
@@ -152,6 +157,9 @@ declare -A POLICY_NAME_MAP=(
   [xvla]="X_VLA"
   [xwam]="X_WAM"
   [xiaomirobotics0]="Xiaomi_Robotics_0"
+  # Remote folder is Meituan_Robotics_0; Meituan_robotic is the user-facing alias.
+  [meituanrobotics0]="Meituan_Robotics_0"
+  [meituanrobotic]="Meituan_Robotics_0"
   [ahawam]="AHA_WAM"
   [hyvla]="Hy_Embodied_05_VLA"
 )
@@ -181,10 +189,11 @@ resolve_local_policy() {
 
 resolve_remote_policy() {
   local requested="$1"
-  local requested_key path name remote_key local_name tree_output
+  local requested_key path name remote_key local_name alias_target tree_output
   local -a matches=()
 
   requested_key="$(normalize_policy_name "${requested}")"
+  alias_target="${POLICY_NAME_MAP[${requested_key}]:-}"
 
   if ! tree_output="$(git -C "${CKPT_CACHE_DIR}" ls-tree -d --name-only "HEAD:${REMOTE_CKPT_ROOT}" 2>/dev/null)"; then
     error "Checkpoint root '${REMOTE_CKPT_ROOT}' was not found in ${REPO_ID} at revision ${REPO_REVISION}."
@@ -196,7 +205,9 @@ resolve_remote_policy() {
     [[ "${name}" != */* ]] || continue
     remote_key="$(normalize_policy_name "${name}")"
     local_name="${POLICY_NAME_MAP[${remote_key}]:-}"
-    if [[ "${remote_key}" == "${requested_key}" || ( -n "${local_name}" && "$(normalize_policy_name "${local_name}")" == "${requested_key}" ) ]]; then
+    if [[ "${remote_key}" == "${requested_key}" \
+      || ( -n "${local_name}" && "$(normalize_policy_name "${local_name}")" == "${requested_key}" ) \
+      || ( -n "${alias_target}" && "$(normalize_policy_name "${alias_target}")" == "${remote_key}" ) ]]; then
       matches+=("${name}")
     fi
   done <<< "${tree_output}"
