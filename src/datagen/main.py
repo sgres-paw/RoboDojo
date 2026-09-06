@@ -20,18 +20,22 @@ def main(args: argparse.Namespace, simulation_app: Any) -> None:
     episode_dir = args.output_dir / args.task_name
     env = create_env(args.task_name, simulation_app)
 
-    # Layouts are pre-baked files, so a run cannot outlast the shipped set.
-    attempts = min(args.num_episodes, len(env.seed_manager.seed_list))
-    if attempts < args.num_episodes:
-        print(f"[datagen] only {attempts} layouts exist; attempting those", flush=True)
+    # Layouts are pre-baked files, so a run cannot outlast the shipped set. Articulated
+    # scenes cannot be re-reset either: every reset mints new instance names and only rigid
+    # objects are re-registered under them, so run those one layout per process.
+    last_layout = min(args.first_layout + args.num_episodes, len(env.seed_manager.seed_list))
+    if last_layout - args.first_layout < args.num_episodes:
+        print(f"[datagen] only {last_layout} layouts exist; attempting up to that", flush=True)
 
     kept_count = 0
-    for layout_id in range(attempts):  # reset indexes pre-baked layout files, not an RNG seed
+    for layout_id in range(args.first_layout, last_layout):  # reset indexes pre-baked layout files, not an RNG seed
         env.reset(seed=[layout_id])
         env.run_reward()  # Registers the staged checks; step() consumes them as they pass
 
         try:
-            frames = record_episode(env, run_task)
+            # Capturing frames costs 70 ms of the 156 ms a control step takes, so a run that only
+            # needs to know which layouts the expert solves skips it and goes about twice as fast.
+            frames = run_task(env) if args.no_record else record_episode(env, run_task)
         except RuntimeError as error:  # No reachable grasp: an unusable layout, not a failure to fix
             print(f"[datagen] layout {layout_id} skipped: {error}", flush=True)
             continue
@@ -42,11 +46,16 @@ def main(args: argparse.Namespace, simulation_app: Any) -> None:
             print(f"[datagen] layout {layout_id} failed with {stages_left} stages left", flush=True)
             continue
 
-        write_episode(frames, episode_dir / f"episode_{kept_count:07d}.hdf5")
         kept_count += 1
+        if args.no_record:
+            print(f"[datagen] layout {layout_id} solved", flush=True)
+            continue
+        write_episode(frames, episode_dir / f"episode_{layout_id:07d}.hdf5")  # By layout, so runs never collide
         print(f"[datagen] layout {layout_id} kept {len(frames)} frames", flush=True)
 
-    print(f"[datagen] {kept_count}/{attempts} episodes written to {episode_dir}", flush=True)
+    attempted = last_layout - args.first_layout
+    verb = "solved" if args.no_record else f"written to {episode_dir}"
+    print(f"[datagen] {kept_count}/{attempted} {verb}", flush=True)
     env.close()
     simulation_app.close()
     os._exit(0)  # Kit's crash reporter otherwise keeps the process alive polling a display
@@ -56,7 +65,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task_name", type=str, default="cover_blocks", help="Task to generate episodes for.")
     parser.add_argument("--num_episodes", type=int, default=10, help="Layouts to attempt, one episode each.")
+    parser.add_argument("--first_layout", type=int, default=0, help="Layout to start from.")
     parser.add_argument("--output_dir", type=Path, default=Path("datagen_result"), help="Where episodes are written.")
+    parser.add_argument(
+        "--no_record", action="store_true", help="Report which layouts the expert solves without writing episodes."
+    )
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
 
