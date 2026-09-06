@@ -1,0 +1,8 @@
+# Submodules and vendored code we do not own; they bury env/ and src/ in the graph.
+XPolicyLab/
+third_party/
+Assets/
+
+# env/ is RoboDojo's manager backbone, not a virtualenv. GitNexus auto-filters that
+# name by default, which silently dropped the entire directory from the index (#771).
+!env/

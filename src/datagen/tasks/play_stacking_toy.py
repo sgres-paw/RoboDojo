@@ -44,8 +44,8 @@ def run(env: Any) -> None:
             return
         lift_pose = current_ee_pose(env, arm).copy()
         lift_pose[2] = max(lift_pose[2], home_poses[arm][2]) + RETREAT_HEIGHT
-        move(env, arm, lift_pose, GRIPPER_OPEN, max_steps_per_segment=TRANSIT_STEPS)  # Up, above the poles
-        move(env, arm, home_poses[arm], GRIPPER_OPEN, max_steps_per_segment=TRANSIT_STEPS)  # Across to home
+        move(env, arm, lift_pose, GRIPPER_OPEN)  # Up, above the poles
+        move(env, arm, home_poses[arm], GRIPPER_OPEN)  # Across to home
 
     for pole_tag, blocks in STACKS:
         pole_xy = support_points(env, "stack_base", pole_tag)[0][:2]  # (2,) world xy of the shaft

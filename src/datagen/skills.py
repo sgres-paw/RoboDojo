@@ -1,16 +1,22 @@
 """Reusable manipulation skills a scripted expert composes into a task."""
 
+from copy import deepcopy
 from typing import Any
 
 import numpy as np
 import transforms3d as t3d
 
+from env.global_configs import BATCH_NUM
 from src.datagen.arrays import to_numpy
 from src.datagen.grasp_bank import load_scene_grasps
+from utils.transformer import cal_quat_dis
 
 GRIPPER_OPEN = 1.0  # Jaws fully apart
 GRIPPER_CLOSED = 0.3  # Grip that holds; grasp and place must match or the carry drops it
 FINGERTIP_OFFSET = 0.1576  # Metres from ee_link down to the closed fingertips, wrist vertical
+WAYPOINTS_PER_LEG = 6  # Planner rows kept per leg. It interpolates at the 4 ms sim step, so following
+# every row costs hundreds of actions and a task runs out of its step budget; take_action lerps
+# between whatever rows it is given, so a handful per leg tracks the same path far more cheaply.
 STRAIGHT_DOWN = np.array([0.70711, 0.0, 0.70711, 0.0])  # Wrist vertical, jaws opening along world x
 
 # Metres from ee_link to the closed fingertips along the approach axis: joint7 origin x 0.08657
@@ -46,6 +52,11 @@ def current_gripper_opening(env: Any, arm: str) -> float:
     joint_low, joint_high = robot.gripper_scale
     opening = (raw_joint_value - joint_low) / (joint_high - joint_low)
     return opening if robot.gripper_move["sign"] == 1 else 1.0 - opening
+
+
+def current_joint_positions(env: Any, arm: str) -> np.ndarray:
+    """Return one arm's current joint positions (n,)."""
+    return np.asarray(env.robot_manager.get_joint(_arm_robot(env, arm), env_idx_list=[0])[0], dtype=float)  # (n,)
 
 
 def object_position(env: Any, object_label: str) -> np.ndarray:
@@ -119,50 +130,178 @@ def rest_joint(env: Any, object_label: str, tag: str) -> float:
 # --- Motion ---
 
 
+def _sample_path(path: np.ndarray) -> list[np.ndarray]:
+    """Return at most WAYPOINTS_PER_LEG evenly spaced rows of a planned joint path (T, n), last included."""
+    rows = np.asarray(path)
+    stride = max(1, int(np.ceil(len(rows) / WAYPOINTS_PER_LEG)))
+    sampled = list(rows[stride - 1 :: stride])
+    if not sampled or not np.array_equal(sampled[-1], rows[-1]):
+        sampled.append(rows[-1])
+    return sampled
+
+
 def move(
     env: Any,
     arm: str,  # "left" or "right"
     ee_pose: np.ndarray,  # (7,) xyz + wxyz, world frame
     gripper_opening: float,  # 0..1, closed to open
-    position_tolerance: float = 0.005,  # Metres from the waypoint that count as arrived
-    max_steps_per_segment: int = 10,  # One step advances about 24 mm, so 10 covers a 5 cm segment
-    segment_length: float = 0.05,  # Metres of travel per Cartesian leg
+    position_tolerance: float = 0.005,  # Metres from the target that count as arrived
+    rotation_tolerance_degrees: float = 5.0,  # Degrees from the target wrist that count as arrived
+    settle_steps: int = 8,  # Control steps held at the last waypoint while the arm converges
 ) -> float:
-    """Step one arm along a near-straight path to a world ee pose (7,); return metres still to go."""
-    # take_action interpolates in joint space and advances ~24 mm, so one long command bows
-    # off the straight line and sweeps the gripper sideways. Short Cartesian legs stay near it.
-    start_position = current_ee_pose(env, arm)[:3].copy()
-    distance = np.linalg.norm(start_position - ee_pose[:3])
-    segment_count = max(1, int(np.ceil(distance / segment_length)))
-
-    # Read the idle arm once: feeding its measured pose back makes its tracking error the next
-    # target, so it creeps down onto whatever is under it.
+    """Plan a collision-free path to a world ee pose (7,) and follow it; return metres still to go."""
+    # curobo solves the whole path once, in joint space, so the gripper no longer bows off the
+    # straight line and the wrist arrives with the position instead of lagging behind it. An
+    # unreachable goal comes back as status "Fail" rather than an arm that quietly does not move:
+    # the ee action branch drops the joint key when IK fails (eval_env.py:415), which is why a bad
+    # pose used to look like a no-op. Both arms must appear in a joint action, so the idle one is
+    # commanded at its measured joints - it cannot creep, because nothing re-derives IK for it.
+    robot = _arm_robot(env, arm)
     idle_arm = "right" if arm == "left" else "left"
-    idle_ee_pose = list(current_ee_pose(env, idle_arm))
-    idle_gripper_opening = [current_gripper_opening(env, idle_arm)]
+    idle_robot = _arm_robot(env, idle_arm)
+    robot_manager = env.robot_manager
 
-    for segment_index in range(1, segment_count + 1):
-        waypoint = ee_pose.copy()  # Orientation is the target's throughout; only position steps
-        waypoint[:3] = start_position + (ee_pose[:3] - start_position) * (segment_index / segment_count)
-        for _ in range(max_steps_per_segment):
-            env.take_action(
-                {
-                    f"{arm}_ee_pose": list(waypoint),
-                    f"{arm}_ee_joint_state": [gripper_opening],
-                    f"{idle_arm}_ee_pose": idle_ee_pose,
-                    f"{idle_arm}_ee_joint_state": idle_gripper_opening,
-                }
-            )
-            # Check after acting: move also drives the gripper at a pose already reached.
-            # take_action is a no-op once end_flag is set, so stop rather than spin.
-            # Check after acting: move also drives the gripper at a pose already reached.
-            # take_action is a no-op once end_flag is set, so stop rather than spin.
-            distance = np.linalg.norm(current_ee_pose(env, arm)[:3] - waypoint[:3])
-            if distance < position_tolerance or env.end_flag[0]:
-                break
+    plan = robot_manager.planner[robot.robot_name].plan_path(
+        curr_joint_pos=robot_manager.get_joint(robot, env_idx_list=[0])[0],
+        target_ee_pose=list(ee_pose),
+        real_robot_pose=deepcopy(robot.entity_origin_pose),
+    )
+    if plan["status"] != "Success" or plan.get("position") is None:
+        raise RuntimeError(f"No path for the {arm} arm to {np.round(np.asarray(ee_pose)[:3], 3).tolist()}")
+
+    waypoints = _sample_path(plan["position"])
+
+    arm_key = robot_manager.process_name(robot.arm_name)
+    gripper_key = robot_manager.process_name(robot.gripper_name)
+    idle_arm_key = robot_manager.process_name(idle_robot.arm_name)
+    idle_gripper_key = robot_manager.process_name(idle_robot.gripper_name)
+    idle_joints = list(np.asarray(robot_manager.get_joint(idle_robot, env_idx_list=[0])[0], dtype=float))
+    idle_gripper = [current_gripper_opening(env, idle_arm)]
+
+    def command(joint_positions: np.ndarray) -> None:
+        """Drive one control step with both arms in joint space."""
+        env.take_action(
+            {
+                arm_key: list(np.asarray(joint_positions, dtype=float)),
+                gripper_key: [gripper_opening],
+                idle_arm_key: idle_joints,
+                idle_gripper_key: idle_gripper,
+            }
+        )
+
+    for joint_positions in waypoints:
+        command(joint_positions)
         if env.end_flag[0]:
             break
+
+    # Hold the last waypoint until both halves of the pose land. The jaws also need the wait: the
+    # gripper command is rate-limited to a fifth of its range per step (control_manager.py:22).
+    distance = float(np.linalg.norm(current_ee_pose(env, arm)[:3] - np.asarray(ee_pose)[:3]))
+    for _ in range(settle_steps):
+        reached = current_ee_pose(env, arm)
+        distance = float(np.linalg.norm(reached[:3] - np.asarray(ee_pose)[:3]))
+        turn = float(np.degrees(cal_quat_dis(reached[3:], np.asarray(ee_pose)[3:])))
+        if (distance < position_tolerance and turn < rotation_tolerance_degrees) or env.end_flag[0]:
+            break
+        command(waypoints[-1])
     return distance
+
+
+def rest(
+    env: Any,
+    arm: str,
+    joint_positions: np.ndarray,  # (n,) the configuration to return to
+    gripper_opening: float = GRIPPER_OPEN,
+    joint_tolerance: float = 0.02,  # Radians on the worst joint that count as arrived
+    settle_steps: int = 12,  # Control steps held at the goal while the arm converges
+) -> float:
+    """Plan back to a joint configuration (n,) and follow it; return radians still to go."""
+    # Homing is a joint goal, not a pose goal. Asked for the home *pose*, the planner refuses it:
+    # home hangs the closed fingertips at z 0.764 against a table top of 0.765, so the goal itself
+    # is in collision. The joint vector the arm started from cannot be, and going joint-to-joint
+    # also drops the hand-built lift-and-cross legs, whose retreat height was often out of reach.
+    robot = _arm_robot(env, arm)
+    idle_arm = "right" if arm == "left" else "left"
+    idle_robot = _arm_robot(env, idle_arm)
+    robot_manager = env.robot_manager
+
+    plan = robot_manager.planner[robot.robot_name].plan_joint(
+        start_joint_pos=current_joint_positions(env, arm),
+        goal_joint_pos=np.asarray(joint_positions, dtype=float),
+    )
+    if plan["status"] != "Success" or plan.get("position") is None:
+        raise RuntimeError(f"No path for the {arm} arm back to its start configuration")
+
+    waypoints = _sample_path(plan["position"])
+
+    idle_joints = list(current_joint_positions(env, idle_arm))
+    idle_gripper = [current_gripper_opening(env, idle_arm)]
+
+    def command(target_joints: np.ndarray) -> None:
+        """Drive one control step with both arms in joint space."""
+        env.take_action(
+            {
+                robot_manager.process_name(robot.arm_name): list(np.asarray(target_joints, dtype=float)),
+                robot_manager.process_name(robot.gripper_name): [gripper_opening],
+                robot_manager.process_name(idle_robot.arm_name): idle_joints,
+                robot_manager.process_name(idle_robot.gripper_name): idle_gripper,
+            }
+        )
+
+    for joints in waypoints:
+        command(joints)
+        if env.end_flag[0]:
+            break
+
+    # Hold the last waypoint until the joints actually land. Without it the arm stops wherever the
+    # final command left it: measured 17 mm from home in position but the wrist a long way round,
+    # which fails all_robot_back_to_origin on its 20 degree half.
+    goal = np.asarray(joint_positions, dtype=float)
+    error = float(np.max(np.abs(current_joint_positions(env, arm) - goal)))
+    for _ in range(settle_steps):
+        error = float(np.max(np.abs(current_joint_positions(env, arm) - goal)))
+        if error < joint_tolerance or env.end_flag[0]:
+            break
+        command(goal)
+    return error
+
+
+def nudge(
+    env: Any,
+    arm: str,
+    ee_pose: np.ndarray,  # (7,) xyz + wxyz, world frame
+    gripper_opening: float,  # 0..1, closed to open
+    steps: int = 8,  # Control steps to press for; contact stops the arm before the target
+) -> float:
+    """Servo one arm toward a world ee pose (7,) without planning; return metres still to go."""
+    # For contact strokes only. A press deliberately aims through the cap and lets the button stop
+    # the arm, so its target sits below the table surface and the planner refuses it - correctly,
+    # since it will not plan into collision. Driving the ee target directly restores the overshoot
+    # the press depends on, at the cost of no collision checking, so keep the travel short.
+    idle_arm = "right" if arm == "left" else "left"
+    idle_ee_pose = list(current_ee_pose(env, idle_arm))
+    idle_gripper = [current_gripper_opening(env, idle_arm)]
+
+    # Step toward the target rather than commanding it outright. The ee branch solves IK per action
+    # and simply omits the joint key when it fails, so a pose past the surface moves the arm not at
+    # all: measured, it stopped 65 mm above the cap. Each intermediate pose is still solvable, so
+    # the arm creeps down until the button stops it.
+    start = current_ee_pose(env, arm)[:3].copy()
+    target = np.asarray(ee_pose, dtype=float)
+    for step in range(1, steps + 1):
+        waypoint = target.copy()
+        waypoint[:3] = start + (target[:3] - start) * (step / steps)
+        env.take_action(
+            {
+                f"{arm}_ee_pose": list(waypoint),
+                f"{arm}_ee_joint_state": [gripper_opening],
+                f"{idle_arm}_ee_pose": idle_ee_pose,
+                f"{idle_arm}_ee_joint_state": idle_gripper,
+            }
+        )
+        if env.end_flag[0]:
+            break
+    return float(np.linalg.norm(current_ee_pose(env, arm)[:3] - target[:3]))
 
 
 # --- Skills ---
@@ -177,7 +316,6 @@ def grasp(
     gripper_open: float = GRIPPER_OPEN,
     gripper_closed: float = GRIPPER_CLOSED,
     position_tolerance: float = 0.005,  # Metres from the target that count as arrived
-    max_steps_per_segment: int = 10,  # One step advances about 24 mm, so 10 covers a 5 cm segment
     approach_height: float = 0.15,  # Metres above the standoff to enter from
 ) -> float:
     """Approach an object from its standoff and close on it; return metres short at the grasp."""
@@ -210,17 +348,31 @@ def grasp(
         return result["status"] == "Success"
 
     def select_grasp() -> np.ndarray:
-        """Return the best-scoring reachable bank grasp (7,) for this arm."""
+        """Return the first bank grasp (7,) the planner can actually reach with this arm."""
+        # Scored by whether a path exists, not whether IK has a solution: solve_ik answers for the
+        # goal alone and accepts poses the arm cannot be driven to, which is how unreachable grasps
+        # used to be chosen. plan_batch asks the same question for a whole batch in one call.
         world_down = np.array([0.0, 0.0, -1.0])
         min_downward_cosine = np.cos(np.radians(max_tilt_degrees))
-        for ee_pose in load_scene_grasps(env, object_label):
-            # The bank ignores the table, so its top candidate is often a side grasp. Both are
-            # unit vectors, so their dot product is cos(tilt from straight down).
-            if approach_axis(ee_pose) @ world_down < min_downward_cosine:
-                continue
-            # The standoff must be reachable too, or the approach cannot be executed.
-            if is_reachable(ee_pose) and is_reachable(pregrasp_pose(ee_pose)):
-                return ee_pose  # (7,)
+        # The bank ignores the table, so its top candidate is often a side grasp. Both are unit
+        # vectors, so their dot product is cos(tilt from straight down).
+        upright = [
+            pose
+            for pose in load_scene_grasps(env, object_label)
+            if approach_axis(pose) @ world_down >= min_downward_cosine
+        ]
+
+        robot = _arm_robot(env, arm)
+        for start in range(0, len(upright), BATCH_NUM):
+            candidates = upright[start : start + BATCH_NUM]  # plan_batch raises above the configured cap
+            result = env.robot_manager.planner[robot.robot_name].plan_batch(
+                env.robot_manager.get_joint(robot, env_idx_list=[0])[0],
+                [list(pregrasp_pose(pose)) for pose in candidates],
+                deepcopy(robot.entity_origin_pose),
+            )
+            for index, status in enumerate(result["status"]):
+                if status == "Success":
+                    return candidates[index]  # (7,)
         raise RuntimeError(f"No reachable grasp for {object_label!r} with the {arm} arm")
 
     ee_pose = select_grasp()
@@ -231,11 +383,19 @@ def grasp(
     above_pose = standoff_pose.copy()
     above_pose[2] += approach_height
 
-    move(env, arm, above_pose, gripper_open, position_tolerance, max_steps_per_segment)  # Up clear of the object
-    move(env, arm, standoff_pose, gripper_open, position_tolerance, max_steps_per_segment)  # Down to the standoff
-    distance = move(env, arm, ee_pose, gripper_open, position_tolerance, max_steps_per_segment)  # Slide in, jaws open
+    # Entering from overhead keeps the jaws off the object on the way in, but the entry pose is
+    # often out of reach - for cover_blocks it is out of reach for all 100 bank grasps. That used
+    # to pass unnoticed, because a move to an unreachable pose quietly did nothing and the run
+    # carried on from the standoff. Now the planner says so, and the standoff, already offset back
+    # along the approach axis, is a safe enough entry on its own when the overhead pose is refused.
+    try:
+        move(env, arm, above_pose, gripper_open, position_tolerance)  # Up clear of the object
+    except RuntimeError:  # Optional leg: solve_ik accepts poses the planner will not plan a path to
+        pass
+    move(env, arm, standoff_pose, gripper_open, position_tolerance)  # Down to the standoff
+    distance = move(env, arm, ee_pose, gripper_open, position_tolerance)  # Slide in, jaws open
     # Same pose, gripper only, so distance never shrinks here.
-    move(env, arm, ee_pose, gripper_closed, position_tolerance, max_steps_per_segment)  # Close on the object
+    move(env, arm, ee_pose, gripper_closed, position_tolerance)  # Close on the object
     return distance
 
 
@@ -249,7 +409,6 @@ def place(
     gripper_open: float = GRIPPER_OPEN,
     gripper_closed: float = GRIPPER_CLOSED,
     position_tolerance: float = 0.005,  # Metres from the target that count as arrived
-    max_steps_per_segment: int = 10,  # One step advances about 24 mm, so 10 covers a 5 cm segment
 ) -> float:
     """Carry a held object to a world position (3,) and release it; return metres short of the release pose."""
 
@@ -283,17 +442,17 @@ def place(
     # Command the grip every leg; under load the jaws read wider than commanded.
     lift_pose = current_ee_pose(env, arm).copy()
     lift_pose[2] = max(lift_pose[2], approach_pose[2])
-    move(env, arm, lift_pose, gripper_closed, position_tolerance, max_steps_per_segment)  # Straight up, still held
-    move(env, arm, approach_pose, gripper_closed, position_tolerance, max_steps_per_segment)  # Across, still high
+    move(env, arm, lift_pose, gripper_closed, position_tolerance)  # Straight up, still held
+    move(env, arm, approach_pose, gripper_closed, position_tolerance)  # Across, still high
 
     # Re-measure: the object shifts and turns in the jaws mid-carry, so the earlier pose no
     # longer lands it right.
     approach_pose = current_ee_pose(env, arm).copy()
     descent_pose = release_pose()
 
-    distance = move(env, arm, descent_pose, gripper_closed, position_tolerance, max_steps_per_segment)  # Down onto it
-    move(env, arm, descent_pose, gripper_open, position_tolerance, max_steps_per_segment)  # Open the jaws
-    move(env, arm, approach_pose, gripper_open, position_tolerance, max_steps_per_segment)  # Back up, empty
+    distance = move(env, arm, descent_pose, gripper_closed, position_tolerance)  # Down onto it
+    move(env, arm, descent_pose, gripper_open, position_tolerance)  # Open the jaws
+    move(env, arm, approach_pose, gripper_open, position_tolerance)  # Back up, empty
     return distance
 
 
@@ -309,7 +468,6 @@ def press(
     released_ratio: float = 0.9,  # Joint travel that counts as released again
     settle_steps: int = 14,  # Control steps to hold clear while the spring returns
     position_tolerance: float = 0.005,
-    max_steps_per_segment: int = 10,
 ) -> float:
     """Push a button down past pressed_ratio and let it spring back; return the ratio it returned to."""
     # Measured: pressing with the wrist the arm already carries reaches the cap within 1 mm,
@@ -324,15 +482,21 @@ def press(
     press_pose = above_pose.copy()
     press_pose[2] = cap_top - descent  # Past the stop; the cap takes the arm's own overshoot
 
-    move(env, arm, above_pose, GRIPPER_CLOSED, position_tolerance, max_steps_per_segment)
-    move(env, arm, press_pose, GRIPPER_CLOSED, position_tolerance, max_steps_per_segment)
+    # Planned where a plan exists, servoed where it does not. The cap sits between the two bases,
+    # and from some carries the planner finds no path to the hover pose even though the arm can
+    # creep there: measured on layout 36, x=0.0 with the left arm.
+    try:
+        move(env, arm, above_pose, GRIPPER_CLOSED, position_tolerance)  # Planned, in free space
+    except RuntimeError:
+        nudge(env, arm, above_pose, GRIPPER_CLOSED, steps=12)
+    nudge(env, arm, press_pose, GRIPPER_CLOSED)  # Servoed, through the cap
     pressed = joint_ratio(env, button_label, tag)
 
-    move(env, arm, above_pose, GRIPPER_CLOSED, position_tolerance, max_steps_per_segment)
+    move(env, arm, above_pose, GRIPPER_CLOSED, position_tolerance)  # Planned again, back clear
     for _ in range(settle_steps):  # Lifting alone leaves it near 0.85; the spring needs a moment
         if joint_ratio(env, button_label, tag) > released_ratio:
             break
-        move(env, arm, above_pose, GRIPPER_CLOSED, position_tolerance, max_steps_per_segment=1)
+        move(env, arm, above_pose, GRIPPER_CLOSED, position_tolerance)
     if pressed > pressed_ratio:
         reached = current_ee_pose(env, arm)
         raise RuntimeError(
@@ -361,7 +525,6 @@ def grasp_top_down(
     lift_height: float = 0.10,  # Metres to raise once closed
     gripper_open: float = GRIPPER_OPEN,
     gripper_closed: float = GRIPPER_CLOSED,
-    max_steps_per_segment: int = 12,
 ) -> float:
     """Take an object straight down with a vertical wrist and lift it; return the metres it rose."""
     # The bank's poses put ee_link where the fingers should be, which buries it in the table for
@@ -376,15 +539,15 @@ def grasp_top_down(
 
     above_pose = grasp_pose.copy()
     above_pose[2] += approach_height
-    move(env, arm, above_pose, gripper_open, max_steps_per_segment=max_steps_per_segment)
-    move(env, arm, grasp_pose, gripper_open, max_steps_per_segment=max_steps_per_segment)
+    move(env, arm, above_pose, gripper_open)
+    move(env, arm, grasp_pose, gripper_open)
 
     # Close where the arm actually stopped, and with no tolerance: at a pose already reached,
     # move returns after one step and the jaws never finish closing.
     closed_pose = current_ee_pose(env, arm).copy()
-    move(env, arm, closed_pose, gripper_closed, position_tolerance=0.0, max_steps_per_segment=max_steps_per_segment)
+    move(env, arm, closed_pose, gripper_closed, position_tolerance=0.0)
 
     lifted_pose = closed_pose.copy()
     lifted_pose[2] += lift_height
-    move(env, arm, lifted_pose, gripper_closed, max_steps_per_segment=max_steps_per_segment)
+    move(env, arm, lifted_pose, gripper_closed)
     return object_position(env, object_label)[2] - start_height

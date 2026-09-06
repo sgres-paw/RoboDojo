@@ -215,7 +215,7 @@ def run(env: Any) -> None:
         move(env, arm, lifted_pose, GRIPPER_CLOSED)  # Straight up off the cap, wrist untouched
 
         lifted_pose[3:] = home_pose[3:]
-        move(env, arm, lifted_pose, GRIPPER_CLOSED, position_tolerance=0.0, max_steps_per_segment=HOME_TURN_STEPS)
+        move(env, arm, lifted_pose, GRIPPER_CLOSED, position_tolerance=0.0)
 
         above_home_pose = home_pose.copy()
         above_home_pose[2] += RETREAT_HEIGHT

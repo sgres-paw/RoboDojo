@@ -115,7 +115,7 @@ def _pick(env: Any, arm: str, object_label: str, ee_poses: list[np.ndarray]) -> 
     for ee_pose in ee_poses:
         above_pose = ee_pose.copy()
         above_pose[2] += APPROACH_HEIGHT  # Enter from directly overhead, so the jaws never sweep a neighbour
-        move(env, arm, above_pose, GRIPPER_OPEN, max_steps_per_segment=STEPS_PER_SEGMENT)
+        move(env, arm, above_pose, GRIPPER_OPEN)
 
         # take_action drops an arm command whose inverse kinematics fails and says nothing, so a
         # pose that solved from the home seed can leave the arm parked at the approach height. Ask
@@ -124,21 +124,19 @@ def _pick(env: Any, arm: str, object_label: str, ee_poses: list[np.ndarray]) -> 
             continue
         # Short legs again: a single 12 cm command has to solve from the approach seed in one go,
         # and when it cannot the arm just stands there; 2 cm legs re-seed from where it now is.
-        residual = move(
-            env, arm, ee_pose, GRIPPER_OPEN, max_steps_per_segment=CARRY_STEPS, segment_length=CARRY_SEGMENT
-        )
+        residual = move(env, arm, ee_pose, GRIPPER_OPEN)
         if residual < DESCENT_TOLERANCE:
             break
 
     # Shut where the arm actually stopped, with no tolerance: at a pose already reached move
     # returns after one step and the jaws never finish closing.
     closed_pose = current_ee_pose(env, arm).copy()
-    move(env, arm, closed_pose, GRIPPER_SQUEEZE, position_tolerance=0.0, max_steps_per_segment=GRIP_STEPS)
+    move(env, arm, closed_pose, GRIPPER_SQUEEZE, position_tolerance=0.0)
 
     # Short legs: the same lift in 5 cm legs shook the phone and the toy car straight back out.
     lifted_pose = closed_pose.copy()
     lifted_pose[2] += LIFT_HEIGHT
-    move(env, arm, lifted_pose, GRIPPER_SQUEEZE, max_steps_per_segment=CARRY_STEPS, segment_length=CARRY_SEGMENT)
+    move(env, arm, lifted_pose, GRIPPER_SQUEEZE)
 
     # Near the edge of its reach the arm finishes the lift short, so this asks only that the piece
     # left the table, not that it rose the whole LIFT_HEIGHT.
@@ -172,15 +170,15 @@ def _carry(env: Any, arm: str, object_label: str, destination_position: np.ndarr
     # Straight up first: a diagonal start drags whatever the object still sits over.
     lift_pose = current_ee_pose(env, arm).copy()
     lift_pose[2] = max(lift_pose[2], approach_pose[2])
-    move(env, arm, lift_pose, GRIPPER_SQUEEZE, max_steps_per_segment=CARRY_STEPS, segment_length=CARRY_SEGMENT)
-    move(env, arm, approach_pose, GRIPPER_SQUEEZE, max_steps_per_segment=CARRY_STEPS, segment_length=CARRY_SEGMENT)
+    move(env, arm, lift_pose, GRIPPER_SQUEEZE)
+    move(env, arm, approach_pose, GRIPPER_SQUEEZE)
 
     # Re-measure: the object shifts in the jaws mid-carry, so the earlier pose no longer lands it right.
     approach_pose = current_ee_pose(env, arm).copy()
     descent_pose = release_pose()
-    move(env, arm, descent_pose, GRIPPER_SQUEEZE, max_steps_per_segment=CARRY_STEPS, segment_length=CARRY_SEGMENT)
-    move(env, arm, descent_pose, GRIPPER_OPEN, position_tolerance=0.0, max_steps_per_segment=RELEASE_STEPS)
-    move(env, arm, approach_pose, GRIPPER_OPEN, max_steps_per_segment=STEPS_PER_SEGMENT)
+    move(env, arm, descent_pose, GRIPPER_SQUEEZE)
+    move(env, arm, descent_pose, GRIPPER_OPEN, position_tolerance=0.0)
+    move(env, arm, approach_pose, GRIPPER_OPEN)
 
 
 def _return_home(env: Any, arm: str, home_poses: dict[str, np.ndarray]) -> None:
@@ -190,12 +188,12 @@ def _return_home(env: Any, arm: str, home_poses: dict[str, np.ndarray]) -> None:
     # a just-relayed camera 0.6 m off the table. Cross over first and turn above home, which is bare.
     raised_pose = current_ee_pose(env, arm).copy()
     raised_pose[2] = max(raised_pose[2], home_poses[arm][2] + RETREAT_HEIGHT)  # A carry already ends up high
-    move(env, arm, raised_pose, GRIPPER_OPEN, max_steps_per_segment=STEPS_PER_SEGMENT)
+    move(env, arm, raised_pose, GRIPPER_OPEN)
 
     over_home_pose = current_ee_pose(env, arm).copy()  # However high the arm actually got
     over_home_pose[:2] = home_poses[arm][:2]
-    move(env, arm, over_home_pose, GRIPPER_OPEN, max_steps_per_segment=STEPS_PER_SEGMENT)
-    move(env, arm, home_poses[arm], GRIPPER_OPEN, max_steps_per_segment=STEPS_PER_SEGMENT)
+    move(env, arm, over_home_pose, GRIPPER_OPEN)
+    move(env, arm, home_poses[arm], GRIPPER_OPEN)
 
 
 def _relay_within_reach(env: Any, object_label: str, table_top: float, home_poses: dict[str, np.ndarray]) -> None:

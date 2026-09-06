@@ -56,12 +56,8 @@ def run(env: Any) -> None:
             return
         lift_pose = current_ee_pose(env, arm).copy()
         lift_pose[2] = max(lift_pose[2], home_poses[arm][2]) + RETREAT_HEIGHT
-        move(
-            env, arm, lift_pose, GRIPPER_OPEN, max_steps_per_segment=TRANSIT_STEPS, segment_length=TRANSIT_SEGMENT
-        )  # Up, above the pieces
-        move(
-            env, arm, home_poses[arm], GRIPPER_OPEN, max_steps_per_segment=TRANSIT_STEPS, segment_length=TRANSIT_SEGMENT
-        )  # Across to home
+        move(env, arm, lift_pose, GRIPPER_OPEN)  # Up, above the pieces
+        move(env, arm, home_poses[arm], GRIPPER_OPEN)  # Across to home
 
     def cross_above(arm: str, target_xy: np.ndarray) -> None:
         """Lift one arm to the travel height and cross to a world xy (2,), jaws open."""
@@ -70,13 +66,9 @@ def run(env: Any) -> None:
         # entered along a slant from the last set-down, the jaws close above it.
         pose = current_ee_pose(env, arm).copy()
         pose[2] = table_height + TRAVEL_HEIGHT
-        move(
-            env, arm, pose, GRIPPER_OPEN, max_steps_per_segment=TRANSIT_STEPS, segment_length=TRANSIT_SEGMENT
-        )  # Straight up, clear of both pieces
+        move(env, arm, pose, GRIPPER_OPEN)  # Straight up, clear of both pieces
         pose[:2] = target_xy
-        move(
-            env, arm, pose, GRIPPER_OPEN, max_steps_per_segment=TRANSIT_STEPS, segment_length=TRANSIT_SEGMENT
-        )  # Across, still high
+        move(env, arm, pose, GRIPPER_OPEN)  # Across, still high
 
     def jaw_yaws(piece: str) -> list[float]:
         """Return the yaws in radians that line the jaws up with this piece's best bank grasps."""
@@ -114,7 +106,7 @@ def run(env: Any) -> None:
             turned_pose[3:] = t3d.quaternions.qmult(
                 t3d.quaternions.axangle2quat([0.0, 0.0, 1.0], error), turned_pose[3:]
             )
-            move(env, arm, turned_pose, GRIPPER_CLOSED, position_tolerance=0.0, max_steps_per_segment=TURN_STEPS)
+            move(env, arm, turned_pose, GRIPPER_CLOSED, position_tolerance=0.0)
 
     def carry(piece: str, position: np.ndarray, orientation: np.ndarray | None = None) -> None:
         """Move one piece to a world position (3,), optionally turning it to an orientation (4,) wxyz."""
