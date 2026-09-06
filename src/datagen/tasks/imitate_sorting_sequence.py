@@ -10,15 +10,18 @@ from src.datagen.skills import (
     GRIPPER_OPEN,
     STRAIGHT_DOWN,
     current_ee_pose,
+    current_joint_positions,
     move,
     object_bbox,
     object_orientation,
     object_position,
+    rest,
 )
 
 NUM_TARGETS = 5  # t0..t4, one per stage of the order the franka demonstrates
 GRIPPER_SQUEEZE = 0.0  # Commanded opening while carrying; GRIPPER_CLOSED leaves a 14 mm gap and drops a phone
 JAW_GAP = 0.0896  # Metres between the open fingertips, X5A.urdf joint7/joint8 travel measured in the scene
+HELD_OFFSET_XY = 0.12  # Metres the object may sit from under the gripper and still be held
 GRIP_CLEARANCE = 0.008  # Metres the closed fingertips clear the table top by
 APPROACH_HEIGHT = 0.10  # Metres above the grasp to descend from; the fingertips clear the tallest piece
 LIFT_HEIGHT = 0.12  # Metres to raise once the jaws are shut
@@ -164,39 +167,57 @@ def _carry(env: Any, arm: str, object_label: str, destination_position: np.ndarr
         ee_pose = current_ee_pose(env, arm)
         return np.r_[ee_pose[:3] + destination_position - object_position(env, object_label), ee_pose[3:]]  # (7,)
 
-    approach_pose = release_pose()
-    approach_pose[2] += CARRY_HEIGHT
+    def still_held() -> None:
+        """Raise unless the object is still under the gripper."""
+        # Measured horizontally: a held object hangs nearly under the gripper. Without this a
+        # dropped one sends release_pose metres away and the planner refuses a pose that was never
+        # sensible - one refusal landed at (-0.592, -0.419, 1.285), off the table.
+        if np.linalg.norm(object_position(env, object_label)[:2] - current_ee_pose(env, arm)[:2]) > HELD_OFFSET_XY:
+            at = np.round(object_position(env, object_label), 3).tolist()
+            raise RuntimeError(f"{object_label!r} is not in the {arm} jaws, it is at {at}")
 
-    # Straight up first: a diagonal start drags whatever the object still sits over.
-    lift_pose = current_ee_pose(env, arm).copy()
-    lift_pose[2] = max(lift_pose[2], approach_pose[2])
-    move(env, arm, lift_pose, GRIPPER_SQUEEZE)
-    move(env, arm, approach_pose, GRIPPER_SQUEEZE)
+    still_held()
+
+    # Rise before crossing so the held object clears whatever it sits over - the planner models the
+    # arm and the table, never the object in the jaws. A fixed height can leave the arm's envelope,
+    # so take the highest that plans rather than insisting on one.
+    for height in (CARRY_HEIGHT, CARRY_HEIGHT / 2, 0.0):
+        approach_pose = release_pose()
+        approach_pose[2] += height
+        lift_pose = current_ee_pose(env, arm).copy()
+        lift_pose[2] = max(lift_pose[2], approach_pose[2])
+        try:
+            move(env, arm, lift_pose, GRIPPER_SQUEEZE)  # Straight up, still held
+            move(env, arm, approach_pose, GRIPPER_SQUEEZE)  # Across, still high
+            break
+        except RuntimeError:
+            continue
+    else:
+        raise RuntimeError(f"No reachable approach above {object_label!r} for the {arm} arm")
 
     # Re-measure: the object shifts in the jaws mid-carry, so the earlier pose no longer lands it right.
+    still_held()
     approach_pose = current_ee_pose(env, arm).copy()
     descent_pose = release_pose()
     move(env, arm, descent_pose, GRIPPER_SQUEEZE)
     move(env, arm, descent_pose, GRIPPER_OPEN, position_tolerance=0.0)
-    move(env, arm, approach_pose, GRIPPER_OPEN)
+    # Retracting only clears the object for whatever comes next; the next skill moves this arm anyway.
+    try:
+        move(env, arm, approach_pose, GRIPPER_OPEN)
+    except RuntimeError:
+        pass
 
 
-def _return_home(env: Any, arm: str, home_poses: dict[str, np.ndarray]) -> None:
-    """Rise, cross to over the home pose with the wrist as it is, then settle into it."""
-    # move commands the target orientation on every leg, so heading straight home turns the wrist a
-    # quarter circle wherever the arm stands and swings the fingers through a 0.16 m arc. That threw
-    # a just-relayed camera 0.6 m off the table. Cross over first and turn above home, which is bare.
-    raised_pose = current_ee_pose(env, arm).copy()
-    raised_pose[2] = max(raised_pose[2], home_poses[arm][2] + RETREAT_HEIGHT)  # A carry already ends up high
-    move(env, arm, raised_pose, GRIPPER_OPEN)
-
-    over_home_pose = current_ee_pose(env, arm).copy()  # However high the arm actually got
-    over_home_pose[:2] = home_poses[arm][:2]
-    move(env, arm, over_home_pose, GRIPPER_OPEN)
-    move(env, arm, home_poses[arm], GRIPPER_OPEN)
+def _return_home(env: Any, arm: str, home_joints: dict[str, np.ndarray]) -> None:
+    """Plan back to the joint configuration the arm started from."""
+    # Home is a joint goal, not a pose goal: it rests the closed fingertips on the table, so the
+    # planner refuses to aim at it. Going joint-to-joint also drops the hand-built rise-and-cross
+    # legs, which existed only because move used to turn the wrist during the travel and swing the
+    # fingers through a 0.16 m arc - the planner carries the wrist along the path instead.
+    rest(env, arm, home_joints[arm], GRIPPER_OPEN)
 
 
-def _relay_within_reach(env: Any, object_label: str, table_top: float, home_poses: dict[str, np.ndarray]) -> None:
+def _relay_within_reach(env: Any, object_label: str, table_top: float, home_joints: dict[str, np.ndarray]) -> None:
     """Have the right arm set an object down in the strip the left arm can also reach."""
     ee_poses = _reachable_grasps(env, "right", object_label, table_top)
     if not ee_poses:
@@ -204,12 +225,13 @@ def _relay_within_reach(env: Any, object_label: str, table_top: float, home_pose
     _pick(env, "right", object_label, ee_poses)
     staging_position = np.r_[STAGING_XY, table_top + _hang_below_origin(env, object_label) + STAGING_CLEARANCE]
     _carry(env, "right", object_label, _aim_centre(env, object_label, staging_position))
-    _return_home(env, "right", home_poses)  # _carry leaves the wrist over the spot the left arm needs
+    _return_home(env, "right", home_joints)  # _carry leaves the wrist over the spot the left arm needs
 
 
 def run(env: Any) -> None:
     """Watch the franka demonstrate an order, then sort t0..t4 into basket0 in that same order."""
     home_poses = {arm: current_ee_pose(env, arm).copy() for arm in ("left", "right")}
+    home_joints = {arm: current_joint_positions(env, arm) for arm in ("left", "right")}
 
     def hold_at_home() -> None:
         """Command both arms to stand at their recorded home poses for one control step."""
@@ -251,7 +273,7 @@ def run(env: Any) -> None:
         # takes a piece on its own side of the table; the right arm relays anything further over.
         ee_poses = _reachable_grasps(env, "left", object_label, table_top)
         if not ee_poses or ee_poses[0][0] > ARM_SPLIT_X:
-            _relay_within_reach(env, object_label, table_top, home_poses)
+            _relay_within_reach(env, object_label, table_top, home_joints)
             ee_poses = _reachable_grasps(env, "left", object_label, table_top)
             if not ee_poses:
                 raise RuntimeError(f"{object_label!r} is still out of the left arm's reach after the relay")
@@ -266,4 +288,4 @@ def run(env: Any) -> None:
 
     # all_robot_back_to_origin is part of the last scored stage.
     for arm in ("left", "right"):
-        _return_home(env, arm, home_poses)
+        _return_home(env, arm, home_joints)

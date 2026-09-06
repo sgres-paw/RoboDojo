@@ -412,6 +412,8 @@ def place(
 ) -> float:
     """Carry a held object to a world position (3,) and release it; return metres short of the release pose."""
 
+    HELD_OFFSET_XY = 0.12  # Metres the object may sit from under the gripper and still be held
+
     def release_pose() -> np.ndarray:
         """Return the ee pose (7,) that lands the held object on its destination, from where it sits now."""
         # == Note ==
@@ -433,6 +435,21 @@ def place(
         held_offset = t3d.quaternions.quat2mat(correction) @ (current_object_position - ee_pose[:3])
         return np.r_[destination_position - held_offset, t3d.quaternions.qmult(correction, ee_pose[3:])]  # (7,)
 
+    # Nothing below means anything if the object is not in the jaws: release_pose aims the gripper
+    # by the offset the object still has to travel, so a dropped object throws the target metres
+    # away and the planner refuses a pose that was never sensible. Measured: targets at
+    # (-0.217, -0.177, 1.071) and y=+0.167, off the table. Say so instead.
+    def check_still_held() -> None:
+        """Raise unless the object is still under the gripper."""
+        # Measured horizontally, not in 3D: a held object hangs nearly under the gripper, while a
+        # dropped one keeps a similar 3D distance yet sits well to the side. Layout 11 put a cube at
+        # y=-0.49, behind the table edge, and a 3D test still called it held.
+        if np.linalg.norm(object_position(env, object_label)[:2] - current_ee_pose(env, arm)[:2]) > HELD_OFFSET_XY:
+            at = np.round(object_position(env, object_label), 3).tolist()
+            raise RuntimeError(f"{object_label!r} is not in the {arm} jaws, it is at {at}")
+
+    check_still_held()
+
     # Three poses: lift_pose straight above the pick-up, approach_pose high over the
     # destination, descent_pose where the jaws open.
     approach_pose = release_pose()
@@ -440,19 +457,52 @@ def place(
 
     # Lift straight up first: a diagonal start drags whatever the object still sits over.
     # Command the grip every leg; under load the jaws read wider than commanded.
-    lift_pose = current_ee_pose(env, arm).copy()
-    lift_pose[2] = max(lift_pose[2], approach_pose[2])
-    move(env, arm, lift_pose, gripper_closed, position_tolerance)  # Straight up, still held
-    move(env, arm, approach_pose, gripper_closed, position_tolerance)  # Across, still high
+    # Lifting first keeps the held object off whatever it still sits over, but the pose is derived
+    # from wherever the arm happens to be, and raising z at a forward xy leaves the arm's envelope:
+    # measured refusals at y=-0.06 and y=-0.09, well in front of the mats. It is an optimisation,
+    # not a requirement - the planner already routes over the table - so a refusal just skips it.
+    # Rising before the crossing matters more than it looks: the planner models the arm and the
+    # table, never the object in the jaws, so a direct path happily drags a held cube across a mat
+    # and knocks it out. Take the highest lift that plans rather than skipping the leg outright.
+    held_height = current_ee_pose(env, arm)[2]
+    for lift_height in (max(held_height, approach_pose[2]), max(held_height, approach_pose[2]) - 0.05, held_height):
+        lift_pose = current_ee_pose(env, arm).copy()
+        lift_pose[2] = lift_height
+        try:
+            move(env, arm, lift_pose, gripper_closed, position_tolerance)  # Straight up, still held
+            break
+        except RuntimeError:
+            continue
+    # A fixed lift above the release can leave the arm's envelope - the handover puts the ee at
+    # (0.005, -0.093, 1.038), far in y and high in z, which the left arm cannot reach. The height
+    # only has to clear whatever sits beside the target, so take the highest one that plans.
+    for height in (approach_height, approach_height / 2, 0.0):
+        approach_pose = release_pose()
+        approach_pose[2] += height
+        try:
+            move(env, arm, approach_pose, gripper_closed, position_tolerance)  # Across, still high
+            break
+        except RuntimeError:
+            continue
+    else:
+        raise RuntimeError(f"No reachable approach above {object_label!r} for the {arm} arm")
 
     # Re-measure: the object shifts and turns in the jaws mid-carry, so the earlier pose no
     # longer lands it right.
+    # Re-check here, not only on entry: the object can slip during the lift or the crossing, and
+    # release_pose() would then aim the gripper metres away from anything sensible.
+    check_still_held()
     approach_pose = current_ee_pose(env, arm).copy()
     descent_pose = release_pose()
 
     distance = move(env, arm, descent_pose, gripper_closed, position_tolerance)  # Down onto it
     move(env, arm, descent_pose, gripper_open, position_tolerance)  # Open the jaws
-    move(env, arm, approach_pose, gripper_open, position_tolerance)  # Back up, empty
+    # Retracting after the release only clears the cube for whatever comes next; the next skill
+    # moves this arm anyway. A refusal here is not a failed placement, so it does not fail the carry.
+    try:
+        move(env, arm, approach_pose, gripper_open, position_tolerance)  # Back up, empty
+    except RuntimeError:
+        pass
     return distance
 
 

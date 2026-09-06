@@ -40,7 +40,15 @@ def main(args: argparse.Namespace, simulation_app: Any) -> None:
             print(f"[datagen] layout {layout_id} skipped: {error}", flush=True)
             continue
 
-        reward = env.reward_manager.get_reward(final_check=True)[0]
+        # The env decides success itself, in is_episode_end (eval_client/eval_env.py): as soon as
+        # get_reward clears the threshold it sets end_flag and success, and stops accepting actions.
+        # That flag is what the benchmark records for a policy, so it is what counts here too. Our
+        # own final_check can disagree - layout 52 of swap_blocks is marked a success at step 538
+        # and then scores 0 on a second evaluation, because the staged checks were already consumed.
+        if env.success[0]:
+            reward = 1.0
+        else:
+            reward = env.reward_manager.get_reward(final_check=True)[0]
         if reward < SUCCESS_REWARD:
             stages_left = len(env.reward_manager.check_list[0])  # Reward is 0.0 either way; this says how far it got
             print(f"[datagen] layout {layout_id} failed with {stages_left} stages left", flush=True)
