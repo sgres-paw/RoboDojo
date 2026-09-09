@@ -17,8 +17,8 @@ SUCCESS_REWARD = 1.0 - 1e-3  # get_reward is 1.0 only if every stage passed; eps
 def main(args: argparse.Namespace, simulation_app: Any) -> None:
     """Attempt one episode per layout and keep the ones the task's own scorer passes."""
     run_task = importlib.import_module(f"src.datagen.tasks.{args.task_name}").run
-    episode_dir = args.output_dir / args.task_name
-    env = create_env(args.task_name, simulation_app)
+    episode_dir = args.output_dir / args.task_name / f"seed_{args.seed}"
+    env = create_env(args.task_name, simulation_app, eval_seed=args.seed)
 
     # Layouts are pre-baked files, so a run cannot outlast the shipped set. Articulated
     # scenes cannot be re-reset either: every reset mints new instance names and only rigid
@@ -74,6 +74,7 @@ if __name__ == "__main__":
     parser.add_argument("--task_name", type=str, default="cover_blocks", help="Task to generate episodes for.")
     parser.add_argument("--num_episodes", type=int, default=10, help="Layouts to attempt, one episode each.")
     parser.add_argument("--first_layout", type=int, default=0, help="Layout to start from.")
+    parser.add_argument("--seed", type=int, default=0, help="Layout set to draw from; 0 to 2 ship with the assets.")
     parser.add_argument("--output_dir", type=Path, default=Path("datagen_result"), help="Where episodes are written.")
     parser.add_argument(
         "--no_record", action="store_true", help="Report which layouts the expert solves without writing episodes."

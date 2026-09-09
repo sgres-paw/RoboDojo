@@ -13,7 +13,7 @@ from utils.load_file import load_yaml
 from utils.pipeline_utils import process_config, process_randomization
 
 
-def create_env(task_name: str, simulation_app: Any) -> Any:
+def create_env(task_name: str, simulation_app: Any, eval_seed: int = 0) -> Any:
     """Return an environment for one task, with a single env and a stubbed policy client."""
     # == Note ==
     # Config assembly copied from src/eval_client/main.py:253-338, minus resume handling.
@@ -28,7 +28,10 @@ def create_env(task_name: str, simulation_app: Any) -> Any:
 
     eval_cfg = load_yaml(eval_config_path / "arx_x5.yml")
     # num_envs feeds SeedManager, which has no default; policy_name names the output dir.
-    eval_cfg.update(task_name=task_name, num_envs=1, policy_name="datagen")
+    # seed picks the layout set: SeedManager reads it for Assets/Eval_Layout/<benchmark>/<task>/<seed>,
+    # and imitate_sorting_sequence reads the matching Traj/<task>/<seed>/<layout>.pkl demonstration.
+    # Three sets ship, 0 to 2, so each layout index yields three different scenes.
+    eval_cfg.update(task_name=task_name, num_envs=1, policy_name="datagen", seed=eval_seed)
     eval_cfg["observation"]["vision"].update(intrinsic_matrix=True, extrinsic_matrix=True)
 
     # arx_x5.yml names one YAML per section; load each by that name.

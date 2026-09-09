@@ -14,9 +14,16 @@ from utils.transformer import cal_quat_dis
 GRIPPER_OPEN = 1.0  # Jaws fully apart
 GRIPPER_CLOSED = 0.3  # Grip that holds; grasp and place must match or the carry drops it
 FINGERTIP_OFFSET = 0.1576  # Metres from ee_link down to the closed fingertips, wrist vertical
-WAYPOINTS_PER_LEG = 6  # Planner rows kept per leg. It interpolates at the 4 ms sim step, so following
-# every row costs hundreds of actions and a task runs out of its step budget; take_action lerps
-# between whatever rows it is given, so a handful per leg tracks the same path far more cheaply.
+WAYPOINTS_PER_LEG = 6  # Fewest planner rows kept per leg. It interpolates at the 4 ms sim step, so
+# following every row costs hundreds of actions and a task runs out of its step budget; take_action
+# lerps between whatever rows it is given, so a handful per leg tracks the same path far more cheaply.
+MAX_WAYPOINTS_PER_LEG = 14  # Most rows kept per leg, so one long leg cannot eat the step budget
+RADIANS_PER_WAYPOINT = 0.15  # Joint-space travel one kept row covers, which sets rows by path length.
+# Every kept row is a control step, so 0.20 was tried to fit imitate_sorting_sequence into the 1090 its
+# 1600 has left after the franka demonstration. It does not pay: the arm then stops 0.030 m short of a
+# grasp against a 0.020 m tolerance, and grasp and drop failures tripled. Save steps on transit legs.
+JOINT_TURN_LIMIT = np.pi  # Radians any wide-range joint may turn on one plan before the path is refused
+WIDE_RANGE_JOINTS = 5  # Joints 1 to 5 carry a plus or minus 10 radian range; joint6 stops at 3.14 by itself
 STRAIGHT_DOWN = np.array([0.70711, 0.0, 0.70711, 0.0])  # Wrist vertical, jaws opening along world x
 
 # Metres from ee_link to the closed fingertips along the approach axis: joint7 origin x 0.08657
@@ -130,10 +137,16 @@ def rest_joint(env: Any, object_label: str, tag: str) -> float:
 # --- Motion ---
 
 
-def _sample_path(path: np.ndarray) -> list[np.ndarray]:
-    """Return at most WAYPOINTS_PER_LEG evenly spaced rows of a planned joint path (T, n), last included."""
+def _sample_path(path: np.ndarray, max_waypoints: int = MAX_WAYPOINTS_PER_LEG) -> list[np.ndarray]:
+    """Return evenly spaced rows of a planned joint path (T, n), by path length, last row included."""
     rows = np.asarray(path)
-    stride = max(1, int(np.ceil(len(rows) / WAYPOINTS_PER_LEG)))
+    # Spacing, not a fixed count. A fixed count gave a 0.30 m cross the same six rows as a 0.05 m
+    # nudge, and take_action lerps between rows, so the long legs ran coarse enough to shake a held
+    # object straight out of the jaws - every drop measured sat on a long leg. Scale the rows with
+    # how far the joints actually travel, and never go below the old count, so no leg gets coarser.
+    travel = float(np.abs(np.diff(rows, axis=0)).sum()) if len(rows) > 1 else 0.0  # Radians, L1
+    wanted = np.clip(np.ceil(travel / RADIANS_PER_WAYPOINT), min(WAYPOINTS_PER_LEG, max_waypoints), max_waypoints)
+    stride = max(1, int(np.ceil(len(rows) / int(wanted))))
     sampled = list(rows[stride - 1 :: stride])
     if not sampled or not np.array_equal(sampled[-1], rows[-1]):
         sampled.append(rows[-1])
@@ -148,6 +161,7 @@ def move(
     position_tolerance: float = 0.005,  # Metres from the target that count as arrived
     rotation_tolerance_degrees: float = 5.0,  # Degrees from the target wrist that count as arrived
     settle_steps: int = 8,  # Control steps held at the last waypoint while the arm converges
+    max_waypoints: int = MAX_WAYPOINTS_PER_LEG,  # Rows to keep; fewer costs fewer control steps
 ) -> float:
     """Plan a collision-free path to a world ee pose (7,) and follow it; return metres still to go."""
     # curobo solves the whole path once, in joint space, so the gripper no longer bows off the
@@ -169,7 +183,27 @@ def move(
     if plan["status"] != "Success" or plan.get("position") is None:
         raise RuntimeError(f"No path for the {arm} arm to {np.round(np.asarray(ee_pose)[:3], 3).tolist()}")
 
-    waypoints = _sample_path(plan["position"])
+    # X5A.urdf gives joints 1 to 5 a range of plus or minus 10 radians, so nothing stops the planner
+    # reaching a pose by winding the shoulder right round the back of the arm. It does: a measured
+    # path turned it 6.82 radians and swung the gripper to y -0.754, behind the arm's own base, which
+    # flung the held object 1.28 m onto the floor. Refuse those and let the caller try another
+    # candidate. Good motions are nowhere near the limit - the worst across two solving tasks was
+    # 0.88 radians - so this only ever rejects the wind-around branch.
+    joint_path = np.asarray(plan["position"])  # (T, n) planned joint rows
+    start_joints = np.asarray(robot_manager.get_joint(robot, env_idx_list=[0])[0], dtype=float)  # (n,)
+    # Bound every loosely ranged joint, not just the shoulder. X5A.urdf gives joints 1 to 5 plus or
+    # minus 10 radians, so any of them can wind the long way round to reach a pose; a measured
+    # refusal had joint3 at 4.48 radians, from which every onward cross was refused. Bound the turn
+    # only, never the absolute angle: the arm does legitimate work near 3.1 radians, and bounding
+    # the angle refused 15 degree motions for standing at 194.
+    turns = np.abs(joint_path[:, :WIDE_RANGE_JOINTS] - start_joints[:WIDE_RANGE_JOINTS]).max(axis=0)  # (n,)
+    if float(turns.max()) > JOINT_TURN_LIMIT:
+        raise RuntimeError(
+            f"The {arm} arm's path to {np.round(np.asarray(ee_pose)[:3], 3).tolist()} winds joint"
+            f"{int(np.argmax(turns)) + 1} {np.degrees(turns.max()):.0f} degrees round"
+        )
+
+    waypoints = _sample_path(joint_path, max_waypoints)
 
     arm_key = robot_manager.process_name(robot.arm_name)
     gripper_key = robot_manager.process_name(robot.gripper_name)
